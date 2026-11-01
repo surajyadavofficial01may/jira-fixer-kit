@@ -1,0 +1,12 @@
+{
+  "name": "jira-fixer-kit",
+  "description": "Jira Fixer plugin for Claude Code and GitHub Copilot in VS Code",
+  "owner": { "name": "Suraj Kumar Yadav" },
+  "plugins": [
+    {
+      "name": "jira-fixer",
+      "source": "./",
+      "description": "Fix Jira tickets with an investigate, plan, approve, implement, verify workflow. A hook blocks file edits until you approve the plan."
+    }
+  ]
+}
