@@ -6,5 +6,7 @@
   "author": { "name": "Suraj Kumar Yadav" },
   "homepage": "https://github.com/surajyadavofficial01may/jira-fixer-kit",
   "repository": "https://github.com/surajyadavofficial01may/jira-fixer-kit",
+  "license": "MIT",
+  "privacyPolicyUrl": "https://github.com/surajyadavofficial01may/jira-fixer-kit#privacy",
   "keywords": ["jira", "atlassian", "workflow", "approval", "bugfix"]
 }

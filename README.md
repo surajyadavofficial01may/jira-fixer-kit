@@ -1,5 +1,8 @@
 # Jira Fixer
 
+[![CI](https://github.com/surajyadavofficial01may/jira-fixer-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/surajyadavofficial01may/jira-fixer-kit/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A plugin for **Claude Code** and **GitHub Copilot in VS Code** that fixes Jira tickets the careful way. It investigates, proposes a minimal plan, **waits for your approval**, then implements with a regression test and checks every acceptance criterion.
 
 A hook blocks file edits until you approve, so the agent cannot skip the review step.
@@ -138,24 +141,20 @@ Create `.jira-fixer.json` at your repository root to change the defaults:
 - **Edits are blocked in an unrelated chat.** A Jira Fixer session is still open in this repository. The agent tells you which ticket. Reply `CLOSE PROJ-1234` (with that key) to end it.
 - **Atlassian tools are missing.** Sign in to the `atlassian` MCP server (Claude Code: `/mcp`; VS Code: **MCP: List Servers**). If you already use another Atlassian connector, that works too.
 
-## For maintainers
+## Privacy
 
-Repository layout (the repository root is both the plugin and its marketplace):
+Jira Fixer has no telemetry and sends nothing anywhere by itself. Its hook script runs on your machine and writes only to `.jira-fixer/` in your repository. Your editor fetches ticket data through Atlassian's MCP server, under Atlassian's privacy policy, and the AI model your editor uses processes it under that provider's terms.
 
-```
-.claude-plugin/plugin.json        plugin manifest
-.claude-plugin/marketplace.json   marketplace catalog (one plugin, source "./")
-skills/jira-fix/                  main workflow, templates, and scripts/gate.js
-skills/jira-analyze/              read-only analysis entry point
-agents/jira-analyst.md            read-only investigator agent
-hooks/hooks.json                  edit guard and approval hooks
-.mcp.json                         Atlassian MCP server
-```
+## Contributing
 
-**Publish:** push to the default branch on GitHub. The repository is public, so anyone can install it without signing in; a private repository would work only for people with access.
+Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, tests, and release process, and [CHANGELOG.md](CHANGELOG.md) for what changed in each version. Please follow the [Code of Conduct](CODE_OF_CONDUCT.md).
 
-**Release an update:** bump `version` in `.claude-plugin/plugin.json` and push. Claude Code users run `/plugin marketplace update jira-fixer-kit`; VS Code users run **Chat: Update Plugins**.
+## Security
 
-**Test before releasing:**
-- `node skills/jira-fix/scripts/gate.js selftest` checks the guard logic. Every line should say PASS.
-- Work through [TESTING.md](TESTING.md) on a throwaway branch in both editors.
+Found a way around the approval gate or the confirmation prompts? Please report it privately. See [SECURITY.md](SECURITY.md).
+
+## License
+
+[MIT](LICENSE) © 2026 Suraj Kumar Yadav
+
+This is an independent project, not affiliated with or endorsed by Atlassian, Anthropic, GitHub, or Microsoft. Jira, Confluence, Claude, GitHub Copilot, and VS Code are trademarks of their respective owners.
