@@ -4,5 +4,7 @@
   "version": "1.0.0",
   "description": "Fix Jira tickets with an investigate, plan, approve, implement, verify workflow. A hook blocks file edits until you approve the plan.",
   "author": { "name": "Suraj Kumar Yadav" },
+  "homepage": "https://github.com/surajyadavofficial01may/jira-fixer-kit",
+  "repository": "https://github.com/surajyadavofficial01may/jira-fixer-kit",
   "keywords": ["jira", "atlassian", "workflow", "approval", "bugfix"]
 }
