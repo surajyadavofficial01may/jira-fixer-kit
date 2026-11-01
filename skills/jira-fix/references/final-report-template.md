@@ -1,8 +1,25 @@
-# {KEY} — Final report
+# {KEY} — Done
 
-**Outcome:** Resolved | Partially resolved | Blocked
+## At a glance
+**Outcome:** ✅ Resolved | ⚠️ Partially resolved | ❌ Blocked
+**Acceptance criteria:** {passed} of {total} pass
+- ✅ AC1 — short criterion
+- ⚠️ AC2 — not verified: needs a manual check (see below)
+- ❌ AC3 — fails: short reason
 
-## Summary
+**Changed:** `{file1}`, `{file2}` · **Tests:** {X} passing, {Y} already failing before (untouched)
+
+**What's left for you:**
+1. Review the diff.
+2. {Manual checks, only if any criterion is not verified}
+3. Commit and open a PR yourself (drafts below).
+4. End the session: choose **Close session** below (or type `CLOSE`).
+
+Legend: ✅ pass · ❌ fail · ⚠️ not verified · ⛔ blocked
+
+---
+
+## What happened
 Two or three sentences: what was wrong, what changed.
 
 ## Root cause
@@ -27,7 +44,7 @@ Two or three sentences: what was wrong, what changed.
 ## Acceptance criteria
 | # | Criterion | Evidence (code) | Evidence (test / check) | Status |
 |---|---|---|---|---|
-| 1 | ... | `path:line` | ... | PASS / FAIL / BLOCKED / NOT VERIFIED |
+| 1 | ... | `path:line` | ... | ✅ / ❌ / ⚠️ / ⛔ |
 
 ## Diff review
 `git diff --stat` summary. Only approved files changed: Yes / No.
@@ -36,7 +53,7 @@ Two or three sentences: what was wrong, what changed.
 - ...
 
 ## Manual verification still needed
-- ...
+- ... (exact steps)
 
 ## Drafts for you (not posted or executed)
 **Jira comment:**
@@ -48,8 +65,3 @@ Two or three sentences: what was wrong, what changed.
 ```
 
 **PR description:** ...
-
-## Next steps for you
-1. Review the diff.
-2. Commit and open a PR yourself.
-3. End the session by replying `CLOSE {KEY}`.

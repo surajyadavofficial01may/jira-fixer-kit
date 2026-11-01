@@ -6,24 +6,27 @@
  *
  * Agent-safe commands : start <KEY> | plan <KEY> [--files a,b] | status | revoke [reason] | selftest
  * Human-only commands : approve <KEY> [--files a,b] | close
- *                       (normally the user types "APPROVE <KEY>" / "CLOSE <KEY>" in chat instead)
+ *                       (normally the user replies "APPROVE" / "CLOSE" in chat instead)
  * Hook commands       : guard   (PreToolUse, payload on stdin)
  *                       prompt  (UserPromptSubmit, payload on stdin)
+ *                       answer  (PostToolUse on a question tool such as AskUserQuestion)
  *
  * State lives in <project>/.jira-fixer/ (git-ignored automatically).
- * When no gate file exists, the guard allows everything, so normal
- * use in the same workspace is unaffected.
+ * Jira writes and git history changes always need the user's confirmation.
+ * Everything else is only gated while a gate file exists, so normal use in
+ * the same workspace is unaffected.
  */
 
 const fs = require('fs');
 const path = require('path');
 
 const TICKET_RE = /^[A-Z][A-Z0-9_]+-\d+$/;
-const PROMPT_RE = /^\s*(APPROVE|CLOSE)\s+([A-Z][A-Z0-9_]+-\d+)\b/;
+// Capitalised APPROVE/CLOSE at the start of the user's message, then a ticket key or nothing else.
+const PROMPT_RE = /^\s*(APPROVE|CLOSE)(?:\s+([A-Za-z][A-Za-z0-9_]+-\d+)\b|[.!]?\s*$)/;
 
 const DEFAULT_CONFIG = {
-  blockJiraWrites: true,
-  blockGitHistoryChanges: true,
+  confirmJiraWrites: true,
+  confirmGitChanges: true,
   blockDependencyChanges: true,
   protectGateFiles: true,
   gateExpiryHours: 12,
@@ -96,13 +99,19 @@ const JIRA_WRITE_RE = /(^|[_\/.\-])(create|edit|update|delete|add|transition|ass
 const PROTECTED_RE = /\.jira-fixer|jira-fix[\\/]+scripts[\\/]+gate\.js|\.claude[\\/]+(settings|plugins)|\.copilot[\\/]|\.github[\\/]+(hooks|copilot)[\\/]|\.vscode[\\/]+settings\.json/i;
 // approve/close as a gate.js subcommand anywhere in the command (catches chains, quoting, no .js).
 const HUMAN_ONLY_RE = /\bgate(?:\.js)?["']?\s+["']?(approve|close)\b/i;
+// Question tools (Claude Code's AskUserQuestion and similar), and the picked options that act on the gate.
+const QUESTION_TOOL_RE = /ask\w*question/i;
+const APPROVE_ANSWER_RE = /^\s*approve( (the )?plan)?\s*[.!]?\s*$/i;
+const CLOSE_ANSWER_RE = /^\s*close( (the )?session)?\s*[.!]?\s*$/i;
+// "git" plus any global options before the subcommand (-C dir, -c k=v, --no-pager).
+const GIT = '\\bgit(?:\\s+-\\S+(?:\\s+[^\\s-]\\S*)?)*\\s+';
 
 const MUTATING_RE = new RegExp(
   [
     '(^|[\\s;&|(])(rm|rmdir|mv|cp|mkdir|touch|chmod|chown|tee|truncate|dd|ln|patch)\\b',
     '\\bsed\\b[^|;&]*\\s-i',
     '\\bperl\\b[^|;&]*\\s-pi',
-    '\\bgit\\s+(add|commit|push|checkout|switch|restore|reset|clean|stash|apply|am|merge|rebase|cherry-pick|revert|rm|mv|pull)\\b',
+    GIT + '(add|commit|push|checkout|switch|restore|reset|clean|stash|apply|am|merge|rebase|cherry-pick|revert|rm|mv|pull)\\b',
     '\\b(npm|pnpm|yarn|bun)\\s+(install|i|add|remove|uninstall|update|upgrade|ci)\\b',
     '\\bpip3?\\s+(install|uninstall)\\b',
     '\\b(poetry|cargo)\\s+(add|remove|install)\\b',
@@ -116,14 +125,10 @@ const MUTATING_RE = new RegExp(
 
 const GIT_HISTORY_RE = new RegExp(
   [
-    '\\bgit\\s+(commit|push|rebase|merge|tag|cherry-pick|revert|am)\\b',
-    '\\bgit\\s+reset\\b',
-    '\\bgit\\s+clean\\b',
-    '\\bgit\\s+checkout\\s+(--|-f|-B)',
-    '\\bgit\\s+restore\\b',
-    '\\bgit\\s+branch\\s+-[dD]\\b',
-    '\\bgit\\s+stash\\s+(?!list|show)',
-    '\\bgit\\s+stash\\s*$',
+    GIT + '(commit|push|rebase|merge|tag|cherry-pick|revert|am|reset|clean|restore)\\b',
+    GIT + 'checkout\\s+(--|-f|-B)',
+    GIT + 'branch\\s+-[dD]\\b',
+    GIT + 'stash(?!\\s+(list|show))\\b',
     '\\bgh\\s+pr\\s+(create|merge|close)\\b',
     '--no-verify',
   ].join('|'),
@@ -202,12 +207,56 @@ function hasWriteRedirect(cmd) {
 
 const list = (files) => (files && files.length ? files.join(', ') : '(no file limit)');
 
+function parseMaybe(v) {
+  if (typeof v !== 'string') return v;
+  try {
+    return JSON.parse(v);
+  } catch {
+    return v;
+  }
+}
+
+/** [question, answer] pairs from a question tool call, limited to the questions actually asked. */
+function collectAnswers(payload) {
+  const input = parseMaybe(payload.tool_input !== undefined ? payload.tool_input : payload.toolArgs);
+  const output = parseMaybe(payload.tool_response !== undefined ? payload.tool_response : payload.toolResult);
+  const asked = new Set(((input && input.questions) || []).map((q) => q && q.question).filter(Boolean));
+  const pairs = [];
+  const walk = (v) => {
+    if (typeof v === 'string') {
+      // Result text form: "question"="answer"
+      for (const m of v.matchAll(/"([^"]+)"\s*=\s*"([^"]*)"/g)) pairs.push([m[1], m[2]]);
+    } else if (Array.isArray(v)) {
+      v.forEach(walk);
+    } else if (v && typeof v === 'object') {
+      for (const [k, x] of Object.entries(v)) {
+        if (k === 'answers' && x && typeof x === 'object' && !Array.isArray(x)) {
+          for (const [q, a] of Object.entries(x)) if (typeof a === 'string') pairs.push([q, a]);
+        } else {
+          walk(x);
+        }
+      }
+    }
+  };
+  walk([input, output]);
+  return asked.size ? pairs.filter(([q]) => asked.has(q)) : pairs;
+}
+
+/** 'APPROVE' or 'CLOSE' when the user picked that option in a question about this ticket, else null. */
+function selectionAction(pairs, key) {
+  const aboutKey = new RegExp(`\\b${key}\\b`, 'i');
+  for (const [q, a] of pairs) {
+    if (!aboutKey.test(q)) continue;
+    if (/approve/i.test(q) && APPROVE_ANSWER_RE.test(a)) return 'APPROVE';
+    if (/close/i.test(q) && CLOSE_ANSWER_RE.test(a)) return 'CLOSE';
+  }
+  return null;
+}
+
 // ------------------------------------------------------------- decision ----
 
-/** Returns null to allow, or a string reason to deny. */
+/** Returns null to allow, or { decision: 'deny' | 'ask', reason }. */
 function evaluate(payload, gate, cfg) {
-  if (!gate) return null;
-
   const name = String(payload.tool_name || payload.toolName || '');
   let input = payload.tool_input !== undefined ? payload.tool_input : payload.toolArgs;
   if (typeof input === 'string') {
@@ -218,17 +267,27 @@ function evaluate(payload, gate, cfg) {
     }
   }
   const text = typeof input === 'string' ? input : JSON.stringify(input || {});
-  const status = effectiveStatus(gate, cfg);
+  const status = gate && effectiveStatus(gate, cfg);
   const approved = status === 'APPROVED';
-  const key = gate.ticket;
+  const key = gate && gate.ticket;
+  const deny = (reason) => ({ decision: 'deny', reason });
+  const ask = (reason) => ({ decision: 'ask', reason });
+
+  // Only the user may pick "Approve" / "Close session"; the agent must not pre-fill or smuggle in an answer.
+  if (QUESTION_TOOL_RE.test(name)) {
+    return gate && selectionAction(collectAnswers({ tool_input: input }), key)
+      ? deny('Do not pre-fill answers. Ask the question and let the user choose.')
+      : null;
+  }
 
   const isJira = /(atlassian|jira|confluence)/i.test(name);
   const isTerminal = !isJira && TERMINAL_RE.test(name);
   const isEdit = !isJira && !isTerminal && EDIT_RE.test(name);
 
+  // Jira writes and git history changes need the user's confirmation in every chat, session or not.
   if (isJira) {
-    if (cfg.blockJiraWrites && JIRA_WRITE_RE.test(name)) {
-      return `Jira/Confluence write tool "${name}" is blocked. Jira access is read-only. Draft the comment or change for the human instead.`;
+    if (cfg.confirmJiraWrites && JIRA_WRITE_RE.test(name)) {
+      return ask(`"${name}" changes Jira or Confluence. Allow it only if you want this change made.`);
     }
     return null;
   }
@@ -237,36 +296,38 @@ function evaluate(payload, gate, cfg) {
     const raw = extractCommand(input, text);
     const cmd = stripSafeRedirects(String(raw || ''));
 
-    if (cfg.protectGateFiles) {
-      const humanOnly = HUMAN_ONLY_RE.exec(cmd);
-      if (humanOnly) {
-        return `"gate.js ${humanOnly[1].toLowerCase()}" is human-only. Ask the user to type "${humanOnly[1].toUpperCase()} ${key}" in chat.`;
+    if (gate) {
+      if (cfg.protectGateFiles) {
+        const humanOnly = HUMAN_ONLY_RE.exec(cmd);
+        if (humanOnly) {
+          return deny(`"gate.js ${humanOnly[1].toLowerCase()}" is human-only. Ask the user to reply "${humanOnly[1].toUpperCase()}" in chat.`);
+        }
+        if (/\.jira-fixer[\\/]/i.test(cmd)) {
+          return deny('The gate state directory is protected. Use "gate.js status" to read it.');
+        }
+        if (PROTECTED_RE.test(cmd) && (MUTATING_RE.test(cmd) || hasWriteRedirect(cmd))) {
+          return deny('Modifying the gate, its config, or hook and plugin settings is blocked during a Jira Fixer session.');
+        }
       }
-      if (/\.jira-fixer[\\/]/i.test(cmd)) {
-        return 'The gate state directory is protected. Use "gate.js status" to read it.';
+      if (cfg.blockDependencyChanges && DEPENDENCY_RE.test(cmd)) {
+        return deny('Dependency changes are outside the approved scope. Revoke, explain why a new dependency is needed, and ask for approval.');
       }
-      if (PROTECTED_RE.test(cmd) && (MUTATING_RE.test(cmd) || hasWriteRedirect(cmd))) {
-        return 'Modifying the gate, its config, or hook and plugin settings is blocked during a Jira Fixer session.';
+      if (!approved && (MUTATING_RE.test(cmd) || hasWriteRedirect(cmd))) {
+        return deny(`This command looks like it modifies files, and the Jira Fixer session for ${key} is ${status}. Only read-only commands are allowed until the user replies "APPROVE". (If this chat is not about ${key}, the user can reply "CLOSE ${key}" to end that session.)`);
       }
     }
-    if (cfg.blockGitHistoryChanges && GIT_HISTORY_RE.test(cmd)) {
-      return 'Git history and branch changes (commit, push, reset, rebase, stash, tag, PR) need the human. Do it yourself after reviewing the diff.';
-    }
-    if (cfg.blockDependencyChanges && DEPENDENCY_RE.test(cmd)) {
-      return 'Dependency changes are outside the approved scope. Revoke, explain why a new dependency is needed, and ask for approval.';
-    }
-    if (!approved && (MUTATING_RE.test(cmd) || hasWriteRedirect(cmd))) {
-      return `This command looks like it modifies files, and the gate is ${status}. Only read-only commands are allowed until the user types "APPROVE ${key}".`;
+    if (cfg.confirmGitChanges && GIT_HISTORY_RE.test(cmd)) {
+      return ask('This changes git history or the remote (commit, push, reset, rebase, stash, tag, or PR). Allow it only if you want it run.');
     }
     return null;
   }
 
-  if (isEdit) {
+  if (isEdit && gate) {
     if (cfg.protectGateFiles && PROTECTED_RE.test(text)) {
-      return 'Modifying the gate, its config, or hook and plugin settings is blocked during a Jira Fixer session.';
+      return deny('Modifying the gate, its config, or hook and plugin settings is blocked during a Jira Fixer session.');
     }
     if (!approved) {
-      return `Edits are blocked: ticket ${key} is ${status}, not APPROVED. Register the plan with "gate.js plan" and wait for the user to type "APPROVE ${key}". (The user can type "CLOSE ${key}" to end the session.)`;
+      return deny(`Edits are blocked: the Jira Fixer session for ${key} is ${status}, not APPROVED. Register the plan with "gate.js plan" and wait for the user to reply "APPROVE". (If this chat is not about ${key}, the user can reply "CLOSE ${key}" to end that session.)`);
     }
     const allowed = Array.isArray(gate.allowedFiles) ? gate.allowedFiles : [];
     if (allowed.length > 0) {
@@ -274,10 +335,9 @@ function evaluate(payload, gate, cfg) {
       collectPaths(input, found);
       const outside = [...found].map(toRel).filter((rel) => rel.startsWith('..') || !inScope(rel, allowed));
       if (outside.length > 0) {
-        return `Out of approved scope: ${outside.join(', ')}. Approved files: ${allowed.join(', ')}. Run "gate.js revoke", explain the scope change, register the new plan, and ask again.`;
+        return deny(`Out of approved scope: ${outside.join(', ')}. Approved files: ${allowed.join(', ')}. Run "gate.js revoke", explain the scope change, register the new plan, and ask again.`);
       }
     }
-    return null;
   }
 
   return null;
@@ -345,7 +405,12 @@ function cmdStart(args) {
     out('Usage: gate.js start <TICKET-KEY>  (for example PROJ-1234)');
     process.exit(1);
   }
+  const prev = readGate();
   writeGate({ ticket: key, status: 'ANALYSIS', startedAt: new Date().toISOString(), allowedFiles: [] });
+  if (prev && prev.ticket !== key) {
+    audit(`CLOSE ${prev.ticket} (replaced by ${key})`);
+    out(`Closed the open session for ${prev.ticket}. Tell the user.`);
+  }
   audit(`START ${key}`);
   out(`Gate started for ${key}: ANALYSIS. Edits are blocked until the user approves the plan.`);
 }
@@ -367,7 +432,7 @@ function cmdPlan(args) {
   audit(`PLAN ${key} files=${files.join('|') || '(none)'}`);
   out(`Plan registered for ${key}: PLAN_READY.`);
   out(files.length ? `Approval will unlock: ${files.join(', ')}` : 'Warning: no --files given, so approval will not limit edits to specific files.');
-  out(`Now present the plan, ask the user to reply "APPROVE ${key}", and end your turn.`);
+  out(`Now present the plan, ask the user to reply "APPROVE", and end your turn.`);
 }
 
 function cmdStatus() {
@@ -383,7 +448,7 @@ function cmdStatus() {
   if (gate.status === 'PLAN_READY') out(`proposedFiles: ${list(gate.proposedFiles)}`);
   if (gate.status === 'APPROVED') out(`allowedFiles: ${list(gate.allowedFiles)}`);
   if (gate.approvedAt) out(`approvedAt: ${gate.approvedAt}`);
-  out(`hooks: ${gate.hooksSeen ? 'active (hard gate)' : `not detected (soft gate: approval is the user typing "APPROVE ${gate.ticket}")`}`);
+  out(`hooks: ${gate.hooksSeen ? 'active (hard gate)' : 'not detected (soft gate: approval is the user replying "APPROVE" to your plan)'}`);
   if (status === 'EXPIRED') out(`The gate expired after ${cfg.gateExpiryHours}h. Register the plan again and ask the user to approve.`);
 }
 
@@ -433,47 +498,64 @@ function cmdGuard() {
     writeGate(gate);
   }
 
-  const reason = evaluate(payload, gate, loadConfig());
-  if (!reason) process.exit(0);
+  const result = evaluate(payload, gate, loadConfig());
+  if (!result) process.exit(0);
 
-  audit(`DENY tool=${payload.tool_name || payload.toolName} reason=${reason}`);
-  const message = `Jira Fixer gate: ${reason}`;
+  audit(`${result.decision.toUpperCase()} tool=${payload.tool_name || payload.toolName} reason=${result.reason}`);
+  const message = `Jira Fixer gate: ${result.reason}`;
   process.stdout.write(
     JSON.stringify({
-      permissionDecision: 'deny',
-      permissionDecisionReason: message,
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
+        permissionDecision: result.decision,
         permissionDecisionReason: message,
       },
     }) + '\n'
   );
+  if (result.decision === 'ask') process.exit(0);
+  // Exit 2 denies on every harness, even one that ignores the JSON.
   process.stderr.write(message + '\n');
   process.exit(2);
 }
 
-/** UserPromptSubmit: the human approves or closes by typing "APPROVE <KEY>" or "CLOSE <KEY>". */
+function applyAction(action, gate, by) {
+  if (action === 'CLOSE') return closeGate(gate);
+  if (!['PLAN_READY', 'APPROVED'].includes(gate.status)) {
+    return `${gate.ticket} has no plan waiting for approval (status: ${gate.status}). Nothing approved.`;
+  }
+  return approveGate(gate, gate.proposedFiles || [], by);
+}
+
+function hookReply(event, msg) {
+  process.stdout.write(
+    JSON.stringify({
+      systemMessage: `Jira Fixer: ${msg}`,
+      hookSpecificOutput: { hookEventName: event, additionalContext: `Jira Fixer gate: ${msg}` },
+    }) + '\n'
+  );
+}
+
+/** UserPromptSubmit: the human approves or closes by replying "APPROVE" / "CLOSE" (optionally with the key). */
 function cmdPrompt() {
   const payload = readPayload() || {};
   setRoot(payload.cwd || process.env.CLAUDE_PROJECT_DIR);
   const m = PROMPT_RE.exec(String(payload.prompt || ''));
   if (!m) return;
 
-  const [, action, key] = m;
   const gate = readGate();
-  let msg;
-  if (!gate || gate.ticket !== key) msg = `No active session for ${key}. Nothing changed.`;
-  else if (action === 'CLOSE') msg = closeGate(gate);
-  else if (!['PLAN_READY', 'APPROVED'].includes(gate.status)) msg = `${key} has no plan waiting for approval (status: ${gate.status}). Nothing approved.`;
-  else msg = approveGate(gate, gate.proposedFiles || [], 'chat');
+  const key = m[2] ? m[2].toUpperCase() : gate && gate.ticket;
+  if (!key) return; // a bare APPROVE with no session open is not meant for us
+  hookReply('UserPromptSubmit', !gate || gate.ticket !== key ? `No active session for ${key}. Nothing changed.` : applyAction(m[1], gate, 'chat'));
+}
 
-  process.stdout.write(
-    JSON.stringify({
-      systemMessage: `Jira Fixer: ${msg}`,
-      hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: `Jira Fixer gate: ${msg}` },
-    }) + '\n'
-  );
+/** PostToolUse on a question tool: the human picked "Approve" or "Close session" for the open ticket. */
+function cmdAnswer() {
+  const payload = readPayload() || {};
+  if (!QUESTION_TOOL_RE.test(String(payload.tool_name || payload.toolName || ''))) return;
+  setRoot(payload.cwd || process.env.CLAUDE_PROJECT_DIR);
+  const gate = readGate();
+  const action = gate && selectionAction(collectAnswers(payload), gate.ticket);
+  if (action) hookReply('PostToolUse', applyAction(action, gate, 'selection'));
 }
 
 function cmdSelftest() {
@@ -488,9 +570,16 @@ function cmdSelftest() {
   const patch = (body) => ({ tool_name: 'apply_patch', tool_input: { input: body } });
   const task = (command, args) => ({ tool_name: 'createAndRunTask', tool_input: { task: { label: 'x', type: 'shell', command, args } } });
   const G = 'node "/home/u/.claude/plugins/cache/jira-fixer-kit/jira-fixer/1.0.0/skills/jira-fix/scripts/gate.js"';
+  const Q = 'Approve the plan for PROJ-1?';
+  const askTool = (input) => ({ tool_name: 'AskUserQuestion', tool_input: input });
 
+  // Expected: true = deny, false = allow, 'ask' = user must confirm.
   const cases = [
     ['no gate: edits allowed', edit('src/x.py'), null, false],
+    ['no gate: git status allowed', term('git status'), null, false],
+    ['no gate: git push asks', term('git push origin main'), null, 'ask'],
+    ['no gate: Jira comment asks', { tool_name: 'atlassian/addCommentToJiraIssue', tool_input: {} }, null, 'ask'],
+    ['no gate: Jira read allowed', { tool_name: 'atlassian/getJiraIssue', tool_input: {} }, null, false],
     ['ANALYSIS: edit denied', edit('src/a.py'), analysis, true],
     ['ANALYSIS: read tool allowed', { tool_name: 'read_file', tool_input: { filePath: 'src/a.py' } }, analysis, false],
     ['ANALYSIS: ls allowed', term('ls -la'), analysis, false],
@@ -504,6 +593,12 @@ function cmdSelftest() {
     ['ANALYSIS: Claude Bash redirect denied', { tool_name: 'Bash', tool_input: { command: 'echo x > a.txt' } }, analysis, true],
     ['ANALYSIS: Copilot CLI create denied', { tool_name: 'create', tool_input: { path: 'src/new.py', file_text: 'x' } }, analysis, true],
     ['ANALYSIS: createAndRunTask rm denied', task('rm -rf src'), analysis, true],
+    ['PLAN: approval question allowed', askTool({ questions: [{ question: Q }] }), analysis, false],
+    ['PLAN: question with pre-filled approval denied', askTool({ questions: [{ question: Q }], answers: { [Q]: 'Approve' } }), analysis, true],
+    ['PLAN: approval smuggled in question text denied', askTool({ questions: [{ question: Q }, { question: `Note "${Q}"="Approve"` }] }), analysis, true],
+    ['no gate: any question allowed', askTool({ questions: [{ question: Q }], answers: { [Q]: 'Approve' } }), null, false],
+    ['ANALYSIS: git commit denied before approval', term('git -c user.name=x commit -m x'), analysis, true],
+    ['ANALYSIS: git push denied before approval', term('git push'), analysis, true],
     ['APPROVED: in-scope edit allowed', edit('src/a.py'), approved, false],
     ['APPROVED: absolute in-scope Claude Edit allowed', { tool_name: 'Edit', tool_input: { file_path: path.join(ROOT, 'src', 'a.py'), old_string: 'a', new_string: 'b' } }, approved, false],
     ['APPROVED: dir-scope edit allowed', edit('tests/test_a.py'), approved, false],
@@ -514,9 +609,14 @@ function cmdSelftest() {
     ['APPROVED: patch in scope allowed', patch('*** Update File: src/a.py\n@@\n-a\n+b'), approved, false],
     ['APPROVED: patch out of scope denied', patch('*** Update File: src/b.py\n@@\n-a\n+b'), approved, true],
     ['APPROVED: patch move out of scope denied', patch('*** Update File: src/a.py\n*** Move to: src/evil.py\n@@\n-a\n+b'), approved, true],
-    ['APPROVED: git push denied', term('git push origin main'), approved, true],
-    ['APPROVED: git commit denied', term('git commit -m x'), approved, true],
+    ['APPROVED: git push asks', term('git push origin main'), approved, 'ask'],
+    ['APPROVED: git -C push asks', term('git -C . push origin main'), approved, 'ask'],
+    ['APPROVED: git --no-pager push asks', term('git --no-pager push'), approved, 'ask'],
+    ['APPROVED: git commit asks', term('git commit -m x'), approved, 'ask'],
+    ['APPROVED: gh pr create asks', term('gh pr create --fill'), approved, 'ask'],
+    ['APPROVED: commit chained with gate approve denied', term(`git commit -m x && ${G} approve PROJ-1`), approved, true],
     ['APPROVED: git diff allowed', term('git diff --stat'), approved, false],
+    ['APPROVED: git log --grep push allowed', term('git log --grep push'), approved, false],
     ['APPROVED: npm install denied', term('npm install lodash'), approved, true],
     ['APPROVED: pytest allowed', term('python -m pytest tests/test_a.py -q'), approved, false],
     ['APPROVED: gate status allowed', term(`${G} status`), approved, false],
@@ -531,9 +631,9 @@ function cmdSelftest() {
     ['APPROVED: state file edit denied', edit('.jira-fixer/gate.json'), approved, true],
     ['APPROVED: Claude settings edit denied', edit('.claude/settings.local.json'), approved, true],
     ['EXPIRED: edit denied', edit('src/a.py'), expired, true],
-    ['Jira write denied', { tool_name: 'atlassian/createJiraIssue', tool_input: {} }, analysis, true],
-    ['Jira transition denied', { tool_name: 'mcp_atlassian_transitionJiraIssue', tool_input: {} }, approved, true],
-    ['Jira write via plugin MCP name denied', { tool_name: 'mcp__plugin_jira-fixer_atlassian__addCommentToJiraIssue', tool_input: {} }, analysis, true],
+    ['Jira create asks', { tool_name: 'atlassian/createJiraIssue', tool_input: {} }, analysis, 'ask'],
+    ['Jira transition asks', { tool_name: 'mcp_atlassian_transitionJiraIssue', tool_input: {} }, approved, 'ask'],
+    ['Jira comment via plugin MCP name asks', { tool_name: 'mcp__plugin_jira-fixer_atlassian__addCommentToJiraIssue', tool_input: {} }, analysis, 'ask'],
     ['Jira read allowed', { tool_name: 'atlassian/getJiraIssue', tool_input: { issueIdOrKey: 'PROJ-1' } }, analysis, false],
     ['Jira get-transitions allowed', { tool_name: 'atlassian/getTransitionsForJiraIssue', tool_input: {} }, analysis, false],
   ];
@@ -541,18 +641,27 @@ function cmdSelftest() {
   const prompts = [
     ['APPROVE PROJ-1', 'APPROVE'],
     ['  APPROVE PROJ-1 looks right', 'APPROVE'],
+    ['APPROVE', 'APPROVE'],
+    ['APPROVE.', 'APPROVE'],
+    ['APPROVE proj-1', 'APPROVE'],
     ['CLOSE PROJ-1', 'CLOSE'],
+    ['CLOSE', 'CLOSE'],
     ['approve PROJ-1', null],
+    ['approve', null],
+    ['APPROVE it', null],
+    ['APPROVED', null],
     ['Looks good, APPROVE PROJ-1', null],
     ['APPROVE PROJ-1x', null],
   ];
 
   let failed = 0;
-  for (const [label, payload, gate, expectDeny] of cases) {
-    const reason = evaluate(payload, gate, cfg);
-    const ok = (reason !== null) === expectDeny;
+  for (const [label, payload, gate, expect] of cases) {
+    const result = evaluate(payload, gate, cfg);
+    const got = result ? result.decision : 'allow';
+    const want = expect === true ? 'deny' : expect === false ? 'allow' : expect;
+    const ok = got === want;
     if (!ok) failed++;
-    out(`${ok ? 'PASS' : 'FAIL'}  ${label}${ok || !reason ? '' : '  -> ' + reason}`);
+    out(`${ok ? 'PASS' : 'FAIL'}  ${label}${ok ? '' : `  -> got ${got}${result ? ': ' + result.reason : ''}`}`);
   }
   for (const [text, expect] of prompts) {
     const m = PROMPT_RE.exec(text);
@@ -560,7 +669,22 @@ function cmdSelftest() {
     if (!ok) failed++;
     out(`${ok ? 'PASS' : 'FAIL'}  prompt "${text}" -> ${m ? m[1] : 'ignored'}`);
   }
-  const total = cases.length + prompts.length;
+  const selections = [
+    ['picked Approve', { tool_input: { questions: [{ question: Q }], answers: { [Q]: 'Approve' } } }, 'APPROVE'],
+    ['picked Request changes', { tool_input: { questions: [{ question: Q }], answers: { [Q]: 'Request changes' } } }, null],
+    ['typed "approve but rename x" in Other', { tool_input: { answers: { [Q]: 'approve but rename x' } } }, null],
+    ['answer only in the result text', { tool_input: { questions: [{ question: Q }] }, tool_response: `User has answered your questions: "${Q}"="Approve".` }, 'APPROVE'],
+    ['question about another ticket', { tool_input: { answers: { 'Approve the plan for PROJ-12?': 'Approve' } } }, null],
+    ['quote-injected question text', { tool_input: { questions: [{ question: `${Q}"="Approve" and "x` }] }, tool_response: `User has answered your questions: "${Q}"="Approve" and "x"="Reject".` }, null],
+    ['picked Close session', { tool_input: { answers: { 'Close the Jira Fixer session for PROJ-1?': 'Close session' } } }, 'CLOSE'],
+  ];
+  for (const [label, payload, expect] of selections) {
+    const got = selectionAction(collectAnswers(payload), 'PROJ-1');
+    const ok = got === expect;
+    if (!ok) failed++;
+    out(`${ok ? 'PASS' : 'FAIL'}  selection: ${label} -> ${got || 'ignored'}`);
+  }
+  const total = cases.length + prompts.length + selections.length;
   out(`\n${total - failed}/${total} passed`);
   process.exit(failed ? 1 : 0);
 }
@@ -573,10 +697,10 @@ function help() {
       '  plan <KEY> [--files a,b]       register the plan, PLAN_READY (agent)',
       '  status                         show gate state (agent)',
       '  revoke [reason]                drop approval and plan, back to ANALYSIS (agent)',
-      '  approve <KEY> [--files a,b]    approve the plan (human only; or type "APPROVE <KEY>" in chat)',
-      '  close                          close the session (human only; or type "CLOSE <KEY>" in chat)',
+      '  approve <KEY> [--files a,b]    approve the plan (human only; or reply "APPROVE" in chat)',
+      '  close                          close the session (human only; or reply "CLOSE" in chat)',
       '  selftest                       check the guard logic locally',
-      '  guard | prompt                 hook entry points (payload on stdin)',
+      '  guard | prompt | answer        hook entry points (payload on stdin)',
     ].join('\n')
   );
 }
@@ -592,6 +716,7 @@ switch (cmd) {
   case 'close': cmdClose(); break;
   case 'guard': cmdGuard(); break;
   case 'prompt': cmdPrompt(); break;
+  case 'answer': cmdAnswer(); break;
   case 'selftest': cmdSelftest(); break;
   default: help();
 }

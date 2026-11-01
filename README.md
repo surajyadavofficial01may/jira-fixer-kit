@@ -59,20 +59,54 @@ To receive updates through a marketplace instead, add this to your user settings
 
 You can also just write "Fix PROJ-1234".
 
-1. The agent reads the ticket, investigates your code, and shows a plan that lists the files it will change. Then it stops.
-2. Read the plan. To approve it, reply with exactly **`APPROVE PROJ-1234`** (capital letters). "ok" or "looks good" does not count.
-3. The agent writes a failing test, makes the fix, runs the tests, and checks each acceptance criterion. It ends with a report that includes a draft Jira comment, commit message, and PR description. It never posts to Jira and never commits.
-4. Review the diff and commit it yourself. Then reply **`CLOSE PROJ-1234`** to end the session.
+1. The agent reads the ticket and investigates your code, posting a short progress line at each step. If the ticket is unclear, it asks a few questions with answers you click (the suggested one is marked "Recommended", and "Other" lets you type your own).
+2. It shows a plan that starts with an **At a glance** summary: problem, cause, fix, files, risk. Then it asks you to choose **Approve**, **Request changes**, or **Reject**.
+3. Click **Approve** to let it change only the listed files. Nothing else counts as approval ("ok" or "looks good" doesn't). You can also type **`APPROVE`**.
+4. The agent writes a failing test, makes the fix, runs the tests, and checks each acceptance criterion. It ends with a report: an **At a glance** checklist (✅ pass, ❌ fail, ⚠️ needs a manual check), what's left for you, and drafts of the Jira comment, commit message, and PR description. It does not post to Jira or commit on its own.
+5. Review the diff and commit it yourself. Then choose **Close session** when asked (or type **`CLOSE`**).
+
+What it looks like:
+
+```text
+You:    /jira-fix PROJ-1234
+Agent:  Step 1/6 · Reading PROJ-1234
+        Step 2/6 · Investigating the code
+        Step 3/6 · Plan ready, waiting for your approval
+
+        At a glance
+        - Problem: cart total ignores the discount code
+        - Cause:   applyDiscount() runs after rounding (src/cart.ts:88). Confidence: High
+        - Fix:     apply the discount before rounding
+        - Files:   src/cart.ts, tests/cart.test.ts (2 files, about 15 lines)
+        ...
+        Approve the plan for PROJ-1234?
+        ❯ Approve           Unlock only: src/cart.ts, tests/cart.test.ts
+          Request changes   Tell me what to adjust
+          Reject            Stop. Nothing is changed
+You:    (clicks Approve)
+        Jira Fixer: Approved PROJ-1234. Edits limited to: src/cart.ts, tests/cart.test.ts.
+Agent:  Step 4/6 · Fixing (failing test first)
+        Step 5/6 · Verifying
+        Step 6/6 · Done
+        Outcome: ✅ Resolved · Acceptance criteria: 3 of 3 pass
+        What's left for you: review the diff and commit
+        Close the Jira Fixer session for PROJ-1234?
+        ❯ Close session
+          Keep it open
+You:    (clicks Close session)
+```
 
 If the agent needs to change a file that is not in the plan, it drops the approval and asks you again.
+
+**You confirm every Jira write, commit, and push.** Whenever the agent tries to change Jira (comment, edit, transition, create) or run `git commit`, `push`, `reset`, `rebase`, `stash`, `tag`, or create a PR, your editor shows a confirmation prompt first. This applies in every chat, even when no Jira Fixer session is open. Before you approve a plan, `commit`, `push`, `reset`, `rebase`, and `stash` are blocked outright.
 
 ## How the gate works
 
 | Layer | What it does |
 |---|---|
 | The `jira-fix` skill | Tells the agent the process and when to stop |
-| The edit guard (hook) | Blocks edits and file-changing commands until you approve; limits edits to the approved files; blocks Jira writes, git commits and pushes, and package installs |
-| The approval hook | Records your approval only when **you** type `APPROVE <KEY>`. The agent cannot approve its own plan |
+| The edit guard (hook) | During a session: blocks edits and file-changing commands until you approve, limits edits to the approved files, and blocks package installs. In every chat: asks you to confirm any Jira write, git commit, push, or PR |
+| The approval hooks | Record your approval only when **you** click **Approve** (or type `APPROVE`). The agent cannot approve its own plan or fill in your answer |
 | The `jira-analyst` agent | Used for analysis. It has no edit or shell tools at all |
 | You | Approve the plan, review the diff, commit |
 
@@ -80,8 +114,10 @@ Session state lives in `.jira-fixer/` at your repository root. That folder ignor
 
 **Limits to know about:**
 - The guard inspects tool names and command text. It is a strong guardrail, not a sandbox, so keep your editor's tool confirmation prompts on.
-- While a session is open, edits are gated for every chat in that repository, not only the Jira one. An approval expires after 12 hours, but the session stays open until you reply `CLOSE <KEY>`.
-- If hooks are not running (Node missing, or hooks turned off), the agent says so and falls back to a soft gate: it still waits for `APPROVE <KEY>`, but nothing enforces it.
+- While a session is open, edits are gated for every chat in that repository, not only the Jira one. An approval expires after 12 hours, but the session stays open until you reply `CLOSE`. Starting a new ticket closes the previous session, and the agent tells you.
+- If hooks are not running (Node missing, or hooks turned off), the agent says so and falls back to a soft gate: it still waits for `APPROVE`, but nothing enforces it.
+- Clickable choices use Claude Code's question tool. In VS Code, if the agent has no question tool or your click doesn't register, type `APPROVE` or `CLOSE` instead. The agent tells you when that's needed.
+- Confirmation prompts come from the hook asking your editor to confirm. If your VS Code version doesn't support that yet, VS Code's own tool confirmation applies instead, so keep it turned on.
 
 ## Configuration (optional)
 
@@ -89,8 +125,8 @@ Create `.jira-fixer.json` at your repository root to change the defaults:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `blockJiraWrites` | `true` | Block Jira and Confluence create, edit, transition, and comment tools |
-| `blockGitHistoryChanges` | `true` | Block commit, push, reset, rebase, stash, tag, and PR creation |
+| `confirmJiraWrites` | `true` | Ask before any Jira or Confluence create, edit, transition, or comment, in every chat |
+| `confirmGitChanges` | `true` | Ask before commit, push, reset, rebase, stash, tag, or PR creation, in every chat |
 | `blockDependencyChanges` | `true` | Block npm, pip, and similar install and add commands |
 | `protectGateFiles` | `true` | The agent cannot edit the gate, its state, or hook and plugin settings |
 | `gateExpiryHours` | `12` | How long an approval lasts |
@@ -98,8 +134,8 @@ Create `.jira-fixer.json` at your repository root to change the defaults:
 
 ## Troubleshooting
 
-- **I typed `APPROVE PROJ-1234` but the agent says it didn't register.** Check the key matches and that the agent showed a plan first. If prompt hooks are not supported in your editor, the agent gives you a one-line terminal command to approve instead.
-- **Edits are blocked in an unrelated chat.** A Jira Fixer session is still open. The block message names the ticket. Reply `CLOSE <KEY>` to end it.
+- **I clicked Approve but the agent says it didn't register.** Type `APPROVE` instead (capitals, at the start of your message). The agent must have shown a plan first. If prompt hooks are not supported in your editor, the agent gives you a one-line terminal command to approve instead.
+- **Edits are blocked in an unrelated chat.** A Jira Fixer session is still open in this repository. The agent tells you which ticket. Reply `CLOSE PROJ-1234` (with that key) to end it.
 - **Atlassian tools are missing.** Sign in to the `atlassian` MCP server (Claude Code: `/mcp`; VS Code: **MCP: List Servers**). If you already use another Atlassian connector, that works too.
 
 ## For maintainers
